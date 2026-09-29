@@ -37,10 +37,10 @@ where INIVDT >= v_tkndat_num
 `v_tkndat_num` is the order's "taken date" - the date the order was placed under its **current** warehouse/ship-to combination. It exists to exclude stale invoice history that belongs to a prior warehouse/ship-to, for orders that went through a `WHSESWITCH`/`SHIPSWITCH` event. The taken date was originally resolved from `ORDAUDH` only.
 
 **Incident Trigger:**
-The EOM429 incident occurred because `ORDAUDH` does not retain a row for orders that have been fully invoiced and cleared - for those orders the lookup found nothing, and partial invoice information was dropped entirely from the EPIC response.
+The EOM429 incident occurred because `ORDAUDH` does not retain a row for orders that have been fully invoiced and cleared - for those orders the lookup found nothing, and partial invoice information was dropped entirely from the EPIC response. A missing `ORDAUDH` row is itself the rare edge case (the vast majority of orders have a matching `ORDAUDH` row); when it does happen, `EXTORD` is checked next.
 
 **Key Business Value:**
-- **No More Silent Drops for the Common Case**: Orders that are still open, or only cleared from `CODATAN` (partial invoice), now fall back to `EXTORD` instead of returning no invoices at all.
+- **No More Silent Drops for the Rare Edge Case**: For the rare case where `ORDAUDH` has no row for the order, the function now falls back to `EXTORD` instead of returning no invoices at all. `EXTORD` still carries a live row for orders that are still open or only partially invoiced, so the taken date can be recovered from there.
 - **Switch-Aware Filtering Preserved**: Where the taken date can be recovered (from `ORDAUDH` or `EXTORD`), the original stale-invoice guard continues to work correctly across warehouse/ship-to switches.
 - **Simple, Low-Cost Chain**: No journal extraction, no per-call `QSYS2.QCMDEXC`/`EZVIEWJRN` overhead, and no job-scoped `QTEMP` file lifecycle to manage. The fallback is two straight-forward table lookups.
 
@@ -50,13 +50,13 @@ The EOM429 incident occurred because `ORDAUDH` does not retain a row for orders 
 
 | Tier | Source | When it applies | Outcome |
 |:-----|:-------|:-----------------|:--------|
-| **1. ORDAUDH** | Existing lookup, current warehouse/ship-to audit history | Always tried first | `v_tkndat_num = AHOFFD`/`AHORTD` |
-| **2. EXTORD** | Live order file | `ORDAUDH` row not found - order still open or only cleared from `CODATAN` (partial invoice) | `v_tkndat_num = TKNDAT` |
-| **(no further fallback)** | N/A | `EXTORD` row also not found - order fully invoiced and cleared from `COMAST`/`CODATAN`/`EXTORD`. Confirmed by the team to be a rare edge case. | `v_tkndat_num` left unresolved (`NULL`) - no invoices returned for that order, see Section 5 |
+| **1. ORDAUDH** | Existing lookup, current warehouse/ship-to audit history | Always tried first - matches for the vast majority of orders | `v_tkndat_num = AHOFFD`/`AHORTD` |
+| **2. EXTORD** | Live order file | `ORDAUDH` row not found - this itself is the rare edge case (order fully invoiced and cleared, order still open/partially invoiced with the audit row never written, or cleared from `CODATAN` only). `EXTORD` still has a live row for open and partially invoiced orders, so it is used to recover the taken date. | `v_tkndat_num = TKNDAT` |
+| **(no further fallback)** | N/A | `EXTORD` row also not found - the order is fully invoiced and cleared from `COMAST`/`CODATAN`/`EXTORD` as well | `v_tkndat_num` left unresolved (`NULL`) - no invoices returned for that order, see Section 5 |
 
 **Bottom line for support:**
 - The filter logic (`INIVDT >= v_tkndat_num`) is unchanged - only the **source** of `v_tkndat_num` has an extra fallback tier now (`EXTORD`).
-- Tiers 1-2 both produce a real, correct taken date. The residual case (both miss) is a confirmed-rare edge case, not a bug - see Section 5.
+- Tier 1 (`ORDAUDH`) resolves the taken date for the vast majority of orders. Reaching tier 2 at all (`ORDAUDH` row not found) is already the rare edge case; both tiers missing is rarer still - see Section 5.
 - If you're troubleshooting missing invoices on a fully-invoiced/cleared, switched order, the question to ask is "did this order's taken date resolve via tier 1/2, or did both lookups miss?" - not "is the filter logic broken."
 
 ---
@@ -91,7 +91,7 @@ graph TD
 This is the shared "resolve the taken date" step every call to `fnc_invoice_invoiced_details` passes through before filtering invoices:
 
 1. Look up `ORDAUDH` for the order's current warehouse/ship-to audit row. If found, use `AHOFFD`/`AHORTD`.
-2. If not found, look up `EXTORD` for the live `TKNDAT`. If found, use it.
+2. If not found, look up `EXTORD` for the live `TKNDAT`. `EXTORD` still has a row for orders that are still open or only partially invoiced, so this recovers the taken date for those orders. If found, use it.
 3. If neither is found, `v_tkndat_num` is left unresolved (`NULL`) - see Section 5 for the effect this has on the invoice filter.
 4. Filter invoices using `INIVDT >= v_tkndat_num` and return the JSON array.
 
@@ -174,13 +174,15 @@ for the remaining miss case was **removed as well**:
   extraction and `QTEMP.EXTORDJ` lifecycle management (pre/post cleanup) from
   `GenerateOrderJson`, since `CSS447B03F` no longer queries that table.
 
-**Rationale:** The team confirmed that the case where **both** `ORDAUDH` and
-`EXTORD` miss (order fully invoiced and cleared from `COMAST`/`CODATAN`/`EXTORD`)
-is a **rare edge case**, not common enough to justify the per-call journal
-extraction cost and `QTEMP` lifecycle management that tier 3 required. `EXTORD`
-alone is considered sufficient fallback coverage for now. The default-0 fallback
-for the residual miss case is also removed pending further team discussion - see
-Section 5 for the current behavior when both lookups miss.
+**Rationale:** `ORDAUDH` not having a row for the order (which triggers the fallback
+to `EXTORD` at all) is itself the rare edge case - the vast majority of orders
+resolve at tier 1. The team confirmed that `EXTORD` alone is sufficient fallback
+coverage for this rare case, and that the further, rarer sub-case where **both**
+`ORDAUDH` and `EXTORD` miss (order fully invoiced and cleared from
+`COMAST`/`CODATAN`/`EXTORD`) is not common enough to justify the per-call journal
+extraction cost and `QTEMP` lifecycle management that tier 3 required. The
+default-0 fallback for that residual miss case is also removed pending further
+team discussion - see Section 5 for the current behavior when both lookups miss.
 
 ---
 
@@ -206,10 +208,11 @@ for every row**, so **no invoices are returned** for that order.
 
 **Consequence:** This reproduces the original EOM429/OMS2489 symptom (partial
 invoice information silently missing from the EPIC response), but now **only**
-for the narrow, team-confirmed-rare case of orders that are fully invoiced and
-cleared **and** have no `ORDAUDH` row **and** no `EXTORD` row. All other orders
-(still open, or only cleared from `CODATAN`) are fixed by the tier-2 `EXTORD`
-fallback.
+for the narrower case of orders that have no `ORDAUDH` row **and** no `EXTORD`
+row. Note that missing `ORDAUDH` alone is already the rare edge case (see
+Section 1.1/1.2); missing both `ORDAUDH` and `EXTORD` is rarer still, since
+those orders are fixed by the tier-2 `EXTORD` fallback whenever `EXTORD` still
+has a row.
 
 **Scope of exposure:** This only affects orders where:
 - the order has been fully invoiced and cleared (no `ORDAUDH` row, no `EXTORD` row).
